@@ -1,0 +1,10 @@
+[package]
+name = "ffffff"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+papaya = "0.2.3"
+tokio = { version = "1.35.1", features = ["full"] }
+tracing = "0.1.41"
+tracing-subscriber = "0.3.20"
