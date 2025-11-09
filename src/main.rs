@@ -1,24 +1,26 @@
-use std::borrow::Cow;
+mod storage;
+
 use std::sync::Arc;
 use papaya::HashMap;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::*;
 use tracing::{Level, debug};
 use tracing_subscriber::FmtSubscriber;
 
-enum Response<T> {
-    Success(T),
+
+enum Response {
+    Success(String),
     Failure,
 }
 
-impl<T> Response<T> where T: ToString {
+impl Response {
     fn parse(&self) -> Vec<u8> {
         let mut result = match self {
             Response::Success(data) => data.to_string().into_bytes(),
-            Response::Failure => "false".as_bytes().to_vec(),
+            Response::Failure => "error".as_bytes().to_vec(),
         };
-        result.push(b'\n');
+        result.push(b'\r');
         result
     }
 
@@ -26,19 +28,23 @@ impl<T> Response<T> where T: ToString {
 
 enum Command {
     Read,
+    Reads,
     Write,
     Delete,
     Status,
+    Keys,
     Error,
 }
 
 impl  Command {
     fn from_op(op: &[u8]) -> Command {
-        match String::from_utf8_lossy(&op).replace('\0', "").as_str() {
+        match String::from_utf8_lossy(&op).replace('\0', "").trim() {
             "read" => Command::Read,
+            "reads" => Command::Reads,
             "write" => Command::Write,
             "delete" => Command::Delete,
             "status" => Command::Status,
+            "keys" => Command::Keys,
             v => {
                 debug!("Unknown command: ~{:?}~", v);
                 Command::Error
@@ -48,115 +54,143 @@ impl  Command {
 }
 
 
-async fn handle_connection(mut socket: TcpStream, state: Arc<HashMap<String, String>>) {
-    let mut op = [0; 6];
-    let mut found = false;
+async fn handle_connection(socket: TcpStream, state: Arc<HashMap<String, String>>) {
+    let (read_half, mut write_half) = socket.into_split();
+    let mut reader = BufReader::new(read_half);
 
-    if let Ok(byte) = socket.read_u8().await {
-        match byte {
-            b'r' | b's' | b'd' | b'w' => {
-                found = true;
-                op[0] = byte;
-                match byte {
-                    b'r' => {
-                        socket.read_exact(&mut op[1..4]).await.unwrap();
-                        socket.read_u8().await.unwrap();
-                    }
-                    b's' => {
-                        socket.read_exact(&mut op[1..6]).await.unwrap();
-                    }
-                    b'd' => {
-                        socket.read_exact(&mut op[1..6]).await.unwrap();
-                    }
-                    b'w' => {
-                        socket.read_exact(&mut op[1..5]).await.unwrap();
-                    }
-                    _ => return,
-                }
+    loop {
+        let mut buffer = Vec::new();
+        reader.read_until(b'\r', &mut buffer).await.unwrap();
+
+
+        if buffer.len() == 0 {
+            debug!("Connection closed");
+            return;
+        }
+
+        match String::from_utf8(buffer.to_vec()).unwrap().split_once(' ')  {
+            Some((op, _rest)) => {
+                debug!("Operation: ~{}~", op.trim());
+                debug!("AAAAAAAAa: ~{}~", _rest.trim());
+
+                let _ =  match Command::from_op(op.trim().as_bytes()) {
+                    Command::Read => write_half.write(&Response::Success("Read".into()).parse()).await.unwrap(),
+                    Command::Reads => write_half.write(&Response::Success("Reads".into()).parse()).await.unwrap(),
+                    Command::Write => write_half.write(&Response::Success("Write".into()).parse()).await.unwrap(),
+                    Command::Delete => write_half.write(&Response::Success("Delete".into()).parse()).await.unwrap(),
+                    Command::Error => write_half.write(&Response::Success("Error".into()).parse()).await.unwrap(),
+                    _ => write_half.write(&Response::Failure.parse()).await.unwrap(),
+                };
             }
-            _ => {
-                socket.write_all(Response::<bool>::Failure.parse().as_ref()).await.unwrap();
-                return;
-            }
+            None => {
+                let _ = match Command::from_op(String::from_utf8(buffer.to_vec()).unwrap().trim().as_bytes()) {
+                    Command::Status => {
+                        write_half.write(&Response::Success("well going our operation".into()).parse()).await.unwrap()
+                    },
+                    Command::Keys => write_half.write(&Response::Success("key1,key2,key3".into()).parse()).await.unwrap(),
+                    _ => {
+                        write_half.write(&Response::Failure.parse()).await.unwrap()
+                    }
+                };
+            },
         }
     }
-
-    debug!("-{}- found: {}", String::from_utf8_lossy(&op), found);
-    if found {
-        parse_commands(state, &mut socket, &op).await;
-    }
-
-
 }
 
 
-async fn parse_commands(state: Arc<HashMap<String, String>>, socket: &mut TcpStream, op: &[u8]) {
-    let mut buffer = Vec::new();
-    debug!("Parsing command...");
-
-    match Command::from_op(&op) {
-        Command::Write => {
-            socket.read_to_end(&mut buffer).await.unwrap();
-
-            match String::from_utf8(buffer.to_vec()).unwrap().split_once("|") {
-                Some((key, value)) => {
-                    debug!("Writing key: '{}' value: '{}'", key.trim(), value.trim());
-                    state.pin().insert(key.trim().to_string(), value.trim().to_string());
-                    socket.write_all(&Response::<bool>::Success(true).parse()).await.unwrap();
-                },
-                None => {
-                    socket.write_all(&Response::<bool>::Failure.parse()).await.unwrap();
-                }
-            }
-
-        },
-        Command::Read => {
-            debug!("Reading...");
-            socket.read_to_end(&mut buffer).await.unwrap();
-
-            let key = String::from_utf8(buffer.to_vec()).unwrap().trim().to_string();
+// async fn parse_commands(state: Arc<HashMap<String, String>>, socket: &mut TcpStream, op: &[u8]) {
+//     let mut buffer = Vec::new();
+//     let mut reader = BufReader::new(&mut *socket);
 
 
-            let r = {
-                let state_ref = state.pin();
-                state_ref.get(&key).map(|v| v.to_string())
-            };
+//     match Command::from_op(&op) {
+//         Command::Write => {
+//             reader.read_until(b'\r', &mut buffer).await.unwrap();
+
+//             match String::from_utf8(buffer.to_vec()).unwrap().split_once("|") {
+//                 Some((key, value)) => {
+//                     debug!("Writing key: '{}' value: '{}'", key.trim(), value.trim());
+//                     state.pin().insert(key.trim().to_string(), value.trim().to_string());
+//                     socket.write_all(&Response::Success("Success".into()).parse()).await.unwrap();
+//                 },
+//                 None => {
+//                     socket.write_all(&Response::Failure.parse()).await.unwrap();
+//                 }
+//             }
+
+//         },
+//         Command::Read => {
+//             debug!("Reading...");
+//             reader.read_until(b'\r', &mut buffer).await.unwrap();
+
+//             let key = String::from_utf8(buffer.to_vec()).unwrap().trim().to_string();
 
 
-            debug!("Read {} bytes, '{}' <{:?}>", buffer.len(), key, r);
-
-            match r {
-                Some(v) => {
-                    socket.write_all(&Response::<String>::Success(v.into()).parse()).await.unwrap();
-                },
-                None => {
-                    socket.write_all(&Response::<bool>::Failure.parse()).await.unwrap();
-                }
-            };
-
-        },
-        Command::Delete => {
-            socket.read_to_end(&mut buffer).await.unwrap();
-
-            let key = String::from_utf8(buffer.to_vec()).unwrap();
-
-            if state.pin().remove(&key).is_some() {
-                socket.write_all(&Response::<bool>::Success(true).parse()).await.unwrap();
-            } else {
-                socket.write_all(&Response::<bool>::Failure.parse()).await.unwrap();
-            }
+//             let r = {
+//                 let state_ref = state.pin();
+//                 state_ref.get(&key).map(|v| v.to_string())
+//             };
 
 
-        },
-        Command::Status => socket.write_all(&Response::<u32>::Success(10).parse()).await.unwrap(),
-        Command::Error => socket.write_all(&Response::<bool>::Failure.parse()).await.unwrap(),
-    }
-}
+//             debug!("Read {} bytes, '{}' <{:?}>", buffer.len(), key, r);
+
+//             match r {
+//                 Some(v) => {
+//                     socket.write_all(&Response::Success(v.into()).parse()).await.unwrap();
+//                 },
+//                 None => {
+//                     socket.write_all(&Response::Failure.parse()).await.unwrap();
+//                 }
+//             };
+
+//         },
+//         Command::Reads => {
+//             debug!("Readings...");
+//             reader.read_until(b'\r', &mut buffer).await.unwrap();
+
+//             let key = String::from_utf8(buffer.to_vec()).unwrap().trim().to_string();
+
+
+//             let r = {
+//                 let state_ref = state.pin();
+//                 state_ref.get(&key).map(|v| v.to_string())
+//             };
+
+
+//             debug!("Read {} bytes, '{}' <{:?}>", buffer.len(), key, r);
+
+//             match r {
+//                 Some(v) => {
+//                     socket.write_all(&Response::Success(v.into()).parse()).await.unwrap();
+//                 },
+//                 None => {
+//                     socket.write_all(&Response::Failure.parse()).await.unwrap();
+//                 }
+//             };
+
+//         },
+//         Command::Delete => {
+//             socket.read_to_end(&mut buffer).await.unwrap();
+
+//             let key = String::from_utf8(buffer.to_vec()).unwrap();
+
+//             if state.pin().remove(&key).is_some() {
+//                 socket.write_all(&Response::Success("Success".into()).parse()).await.unwrap();
+//             } else {
+//                 socket.write_all(&Response::Failure.parse()).await.unwrap();
+//             }
+
+
+//         },
+//         Command::Status => socket.write_all(&Response::Success("well going our operation".into()).parse()).await.unwrap(),
+//         _ => socket.write_all(&Response::Failure.parse()).await.unwrap(),
+//     }
+// }
 
 #[tokio::main]
 async fn main() {
     let subscriber = FmtSubscriber::builder()
-        .with_max_level(Level::DEBUG)
+        .with_max_level(Level::INFO)
         .finish();
 
     tracing::subscriber::set_global_default(subscriber)
@@ -172,6 +206,8 @@ async fn main() {
 
     loop {
         let (socket, _) = listener.accept().await.unwrap();
+
+        debug!("New connection established from {}", socket.peer_addr().unwrap());
 
 
         let state = Arc::clone(&state);
