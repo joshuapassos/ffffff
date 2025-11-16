@@ -1,7 +1,7 @@
 const net = require('net');
 
 class KVDBClient {
-  constructor(host = '127.0.0.1', port = 6969) {
+  constructor(host = 'localhost', port = 6969) {
     this.host = host;
     this.port = port;
     this.socket = null;
@@ -19,8 +19,6 @@ class KVDBClient {
       const timeout = setTimeout(() => {
         reject(new Error('Connection timeout'));
       }, 5000);
-
-      console.log(`Conectando ao servidor ${this.host}:${this.port}...`);
 
       this.socket.connect(this.port, this.host, () => {
         clearTimeout(timeout);
