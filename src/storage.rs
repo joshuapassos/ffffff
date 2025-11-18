@@ -1,8 +1,10 @@
 use bincode::{Decode, Encode};
 use serde::{Deserialize, Serialize, de::value};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::{collections::BTreeMap, path::PathBuf};
 use tracing::debug;
+use tracing_subscriber::field::debug;
 
 #[derive(Debug, PartialEq, Eq)]
 #[repr(C)]
@@ -50,7 +52,7 @@ enum EntryState {
     Used = 0,
     Deleted = 1,
 }
-
+#[derive(Debug, PartialEq, Eq)]
 struct HashEntry {
     hash_key: [u8; 32],
     size_key: u64,
@@ -89,7 +91,7 @@ impl HashEntry {
             _ => {
                 debug!("Invalid entry state: {}", bytes[1080]);
                 EntryState::Deleted
-            },
+            }
         };
         HashEntry {
             hash_key,
@@ -145,8 +147,8 @@ impl Storage {
                 total_size: initial_size,
                 keys: 0 as u64,
                 lookup_start: Header::SIZE as u64,
-                start_data: Header::SIZE as u64 + 1024 * 1024 * 1024,
-                offset_free: Header::SIZE as u64 + 1024 * 1024 * 1024,
+                start_data: Header::SIZE as u64 + 1024 * 1024 * 1024 * 4,
+                offset_free: Header::SIZE as u64 + 1024 * 1024 * 1024 * 4,
             };
             let header_bytes = header.to_bytes();
             (&mut mmap[0..Header::SIZE]).copy_from_slice(&header_bytes);
@@ -228,11 +230,6 @@ impl Storage {
 
         self.btree.add(&entry.hash_key, p_0);
 
-        // let content = self.btree.serialize();
-
-        // self.mmap1kb[0..content.len()].copy_from_slice(content.as_slice());
-
-        // let _ = self.mmap1kb.flush_async();
         let _ = self.mmap.flush_async();
 
         Ok(())
@@ -256,6 +253,11 @@ impl Storage {
         }
 
         results
+    }
+
+    pub fn get_all_keys(&self) -> Vec<[u8; 32]> {
+        let result = self.get_all();
+        result.into_iter().map(|(k, _)| k).collect()
     }
 
     pub fn flush(&mut self) -> std::io::Result<()> {
@@ -285,6 +287,15 @@ impl Storage {
         if buff.len() > 0 { Some(buff) } else { None }
     }
 
+    pub fn get_el(&self, offset: u64) -> &[u8] {
+        let entry = HashEntry::from_bytes(
+            &self.mmap[offset as usize..(offset + HashEntry::SIZE as u64) as usize],
+        );
+        let data_offset = entry.data_offset;
+        let data_size = entry.size;
+        &self.mmap[data_offset as usize..(data_offset + data_size) as usize]
+    }
+
     pub fn get_by_btree(&self, key: &[u8]) -> Option<&[u8]> {
         let str_key = str::from_utf8(key).unwrap();
 
@@ -295,6 +306,7 @@ impl Storage {
                 );
                 let data_offset = entry.data_offset;
                 let data_size = entry.size;
+                debug!("Found key '{}' - {:?}", str_key, entry);
                 Some(&self.mmap[data_offset as usize..(data_offset + data_size) as usize])
             }
             _ => None,
@@ -302,7 +314,8 @@ impl Storage {
     }
 
     pub fn del(&mut self, key: &[u8]) -> std::io::Result<()> {
-        match self.btree.get(str::from_utf8(key).unwrap()) {
+        let k = str::from_utf8(key).unwrap();
+        match self.btree.get(k) {
             Some(offset) => {
                 let mut entry = HashEntry::from_bytes(
                     &self.mmap[*offset as usize..(*offset + HashEntry::SIZE as u64) as usize],
@@ -310,6 +323,7 @@ impl Storage {
                 entry.state = EntryState::Deleted;
                 self.mmap[*offset as usize..(*offset + HashEntry::SIZE as u64) as usize]
                     .copy_from_slice(&entry.to_bytes());
+                self.btree.del(k);
                 self.mmap.flush_async()?;
                 Ok(())
             }
@@ -321,71 +335,50 @@ impl Storage {
     }
 }
 
-#[derive(Encode, Decode)]
 struct BTree {
-    b_tree_1kb: BTreeMap<Vec<u8>, u64>,
-    b_tree_10kb: BTreeMap<Vec<u8>, u64>,
-    b_tree_100kb: BTreeMap<Vec<u8>, u64>,
+    index: HashMap<[u8; 32], u64>,
 }
 
 impl BTree {
     fn new(m: Vec<([u8; 32], u64)>) -> Self {
         BTree {
-            b_tree_1kb: m.into_iter().map(|(k, v)| (k.to_vec(), v)).collect(),
-            b_tree_10kb: BTreeMap::new(),
-            b_tree_100kb: BTreeMap::new(),
+            index: m.into_iter().map(|(k, v)| (k, v)).collect(),
         }
     }
 
     fn add(&mut self, key: &[u8; 32], value: u64) {
-        if key.len() <= 1024 {
-            self.b_tree_1kb.insert(key.to_vec(), value);
-        } else if key.len() <= 10 * 1024 {
-            self.b_tree_10kb.insert(key.to_vec(), value);
-        } else if key.len() <= 100 * 1024 {
-            self.b_tree_100kb.insert(key.to_vec(), value);
-        }
+        self.index.insert(*key, value);
     }
 
     fn get(&self, key: &str) -> Option<&u64> {
-        if key.len() <= 1024 {
-            self.b_tree_1kb.get(&Sha256::digest(key).to_vec())
-        } else if key.len() <= 10 * 1024 {
-            self.b_tree_10kb.get(&Sha256::digest(key).to_vec())
-        } else if key.len() <= 100 * 1024 {
-            self.b_tree_100kb.get(&Sha256::digest(key).to_vec())
-        } else {
-            None
-        }
+        let mut buf = [0; 32];
+        let f = Sha256::digest(key);
+        buf.copy_from_slice(&f);
+
+        self.index.get(&buf)
     }
 
     fn del(&mut self, key: &str) {
-        if key.len() <= 1024 {
-            self.b_tree_1kb.remove(&Sha256::digest(key).to_vec());
-        } else if key.len() <= 10 * 1024 {
-            self.b_tree_10kb.remove(&Sha256::digest(key).to_vec());
-        } else if key.len() <= 100 * 1024 {
-            self.b_tree_100kb.remove(&Sha256::digest(key).to_vec());
-        }
+        let mut buf = [0; 32];
+        let f = Sha256::digest(key);
+        buf.copy_from_slice(&f);
+
+        self.index.remove(&buf);
     }
 
-    // from https://docs.rs/bincode/latest/bincode/#example
-    fn serialize(&self) -> Vec<u8> {
-        bincode::encode_to_vec(
-            &self.b_tree_1kb,
-            bincode::config::standard().with_fixed_int_encoding(),
-        )
-        .unwrap()
-    }
-    // from https://docs.rs/bincode/latest/bincode/#example
-    fn deserialize(data: &[u8]) -> Self {
-        let (b_tree_1kb, _): (BTreeMap<Vec<u8>, u64>, _) =
-            bincode::decode_from_slice(data, bincode::config::standard().with_fixed_int_encoding())
-                .unwrap();
-        BTree {
-            b_tree_1kb,
-            b_tree_10kb: BTreeMap::new(),
-            b_tree_100kb: BTreeMap::new(),
-        }
-    }
+    // // from https://docs.rs/bincode/latest/bincode/#example
+    // fn serialize(&self) -> Vec<u8> {
+    //     bincode::encode_to_vec(
+    //         &self.b_tree_1kb,
+    //         bincode::config::standard().with_fixed_int_encoding(),
+    //     )
+    //     .unwrap()
+    // }
+    // // from https://docs.rs/bincode/latest/bincode/#example
+    // fn deserialize(data: &[u8]) -> Self {
+    //     let (b_tree_1kb, _): (BTreeMap<Vec<u8>, u64>, _) =
+    //         bincode::decode_from_slice(data, bincode::config::standard().with_fixed_int_encoding())
+    //             .unwrap();
+    //     BTree { b_tree_1kb }
+    // }
 }

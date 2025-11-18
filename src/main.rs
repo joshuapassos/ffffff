@@ -1,25 +1,20 @@
 mod storage;
 
 use std::sync::Arc;
-use papaya::HashMap;
 
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::*;
-use tokio::sync::{Mutex, RwLock};
+use tokio::signal;
+use tokio::sync::{RwLock};
 use tracing::{Level, debug};
 use tracing_subscriber::FmtSubscriber;
-use tokio::signal;
 
-enum Response<T>{
+enum Response<T> {
     Success(T),
     Failure,
 }
 
-
-
-
-
-impl Response<String>  {
+impl Response<String> {
     fn parse(&self) -> Vec<u8> {
         let mut result = match self {
             Response::Success(data) => data.to_string().into_bytes(),
@@ -28,10 +23,9 @@ impl Response<String>  {
         result.push(b'\r');
         result
     }
-
 }
 
-impl Response<&[u8]>  {
+impl Response<&[u8]> {
     fn parse(&self) -> Vec<u8> {
         let mut result = match self {
             Response::Success(data) => data.to_vec(),
@@ -40,7 +34,6 @@ impl Response<&[u8]>  {
         result.push(b'\r');
         result
     }
-
 }
 
 enum Command {
@@ -53,7 +46,7 @@ enum Command {
     Error,
 }
 
-impl  Command {
+impl Command {
     fn from_op(op: &[u8]) -> Command {
         match String::from_utf8_lossy(&op).replace('\0', "").trim() {
             "read" => Command::Read,
@@ -65,11 +58,10 @@ impl  Command {
             v => {
                 debug!("Unknown command: ~{:?}~", v);
                 Command::Error
-            },
+            }
         }
     }
 }
-
 
 async fn handle_connection(socket: TcpStream, state: Arc<RwLock<storage::Storage>>) {
     let (read_half, mut write_half) = socket.into_split();
@@ -79,62 +71,111 @@ async fn handle_connection(socket: TcpStream, state: Arc<RwLock<storage::Storage
         let mut buffer = Vec::new();
         reader.read_until(b'\r', &mut buffer).await.unwrap();
 
-
         if buffer.len() == 0 {
             debug!("Connection closed");
             return;
         }
 
-        match String::from_utf8(buffer.to_vec()).unwrap().split_once(' ')  {
+        match String::from_utf8(buffer.to_vec()).unwrap().split_once(' ') {
             Some((op, rest)) => {
                 debug!("Operation: ~{}~", op.trim());
                 debug!("AAAAAAAAa: ~{}~", rest.trim());
 
-                let _ =  match Command::from_op(op.trim().as_bytes()) {
-                    Command::Read =>
-                        match state.read().await.get_by_btree(rest.trim().as_bytes()){
+                let _ = match Command::from_op(op.trim().as_bytes()) {
+                    Command::Read => {
+                        match state.read().await.get_by_btree(rest.trim().as_bytes()) {
                             Some(v) => {
-                            debug!("Read key: '{}' value: '{:?}'", rest.trim(), v);
-                            write_half.write(&Response::Success(v).parse()).await.unwrap()
-                        }
+                                debug!("Read key: '{}' value: '{:?}'", rest.trim(), v);
+                                write_half
+                                    .write(&Response::Success(v).parse())
+                                    .await
+                                    .unwrap()
+                            }
                             None => {
                                 debug!("Read key: '{}' not found", rest.trim());
-                                write_half.write(&Response::<&[u8]>::Failure.parse()).await.unwrap()
-                            }
-                        },
-                    Command::Reads => write_half.write(&Response::<String>::Success("Reads".into()).parse()).await.unwrap(),
-                    Command::Write => {
-                        match rest.trim().split_once("|") {
-                            Some((key, value)) => {
-                                debug!("Writing key: '{}' value: '{}'", key.trim(), value.trim());
-                                state.write().await.add(key.trim().as_bytes(), value.trim().as_bytes()).unwrap();
-                                write_half.write(&Response::<String>::Success("Success".into()).parse()).await.unwrap()
-                            },
-                            None => {
-                                write_half.write(&Response::<String>::Failure.parse()).await.unwrap()
+                                write_half
+                                    .write(&Response::<&[u8]>::Failure.parse())
+                                    .await
+                                    .unwrap()
                             }
                         }
+                    }
+                    Command::Reads => write_half
+                        .write(&Response::<String>::Success("Reads".into()).parse())
+                        .await
+                        .unwrap(),
+                    Command::Write => match rest.trim().split_once("|") {
+                        Some((key, value)) => {
+                            debug!("Writing key: '{}' value: '{}'", key.trim(), value.trim());
+                            state
+                                .write()
+                                .await
+                                .add(key.trim().as_bytes(), value.trim().as_bytes())
+                                .unwrap();
+                            write_half
+                                .write(&Response::<String>::Success("success".into()).parse())
+                                .await
+                                .unwrap()
+                        }
+                        None => write_half
+                            .write(&Response::<String>::Failure.parse())
+                            .await
+                            .unwrap(),
                     },
-                    Command::Delete => write_half.write(&Response::<String>::Success("Delete".into()).parse()).await.unwrap(),
-                    Command::Error => write_half.write(&Response::<String>::Success("Error".into()).parse()).await.unwrap(),
-                    _ => write_half.write(&Response::<String>::Failure.parse()).await.unwrap(),
+                    Command::Delete => {
+                        match state.write().await.del(rest.trim().as_bytes()) {
+                            Ok(_) => {
+                                debug!("Deleted key: '{}'", rest.trim());
+                                write_half
+                                    .write(&Response::<String>::Success("success".into()).parse())
+                                    .await
+                                    .unwrap()
+                            }
+                            Err(e) => {
+                                debug!("Error deleting key: '{}' error: {}", rest.trim(), e);
+                                write_half
+                                    .write(&Response::<String>::Failure.parse())
+                                    .await
+                                    .unwrap()
+                            }
+                        }
+                    }
+                    Command::Error => write_half
+                        .write(&Response::<String>::Success("Error".into()).parse())
+                        .await
+                        .unwrap(),
+                    _ => write_half
+                        .write(&Response::<String>::Failure.parse())
+                        .await
+                        .unwrap(),
                 };
             }
             None => {
-                let _ = match Command::from_op(String::from_utf8(buffer.to_vec()).unwrap().trim().as_bytes()) {
-                    Command::Status => {
-                        write_half.write(&Response::<String>::Success("well going our operation".into()).parse()).await.unwrap()
-                    },
-                    Command::Keys => write_half.write(&Response::<String>::Success("key1,key2,key3".into()).parse()).await.unwrap(),
-                    _ => {
-                        write_half.write(&Response::<String>::Failure.parse()).await.unwrap()
-                    }
+                let _ = match Command::from_op(
+                    String::from_utf8(buffer.to_vec())
+                        .unwrap()
+                        .trim()
+                        .as_bytes(),
+                ) {
+                    Command::Status => write_half
+                        .write(
+                            &Response::<String>::Success("well going our operation".into()).parse(),
+                        )
+                        .await
+                        .unwrap(),
+                    Command::Keys => write_half
+                        .write(&Response::<String>::Success("key1,key2,key3".into()).parse())
+                        .await
+                        .unwrap(),
+                    _ => write_half
+                        .write(&Response::<String>::Failure.parse())
+                        .await
+                        .unwrap(),
                 };
-            },
+            }
         }
     }
 }
-
 
 #[tokio::main]
 async fn main() {
@@ -142,16 +183,20 @@ async fn main() {
         .with_max_level(Level::INFO)
         .finish();
 
-    tracing::subscriber::set_global_default(subscriber)
-        .expect("setting default subscriber failed");
+    tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
 
     let addr = "127.0.0.1:6969";
     let listener = TcpListener::bind(addr).await.unwrap();
 
     debug!("Server running on {}", addr);
 
-    let state = Arc::new(RwLock::new(storage::Storage::open(std::path::PathBuf::from("data.store"), 10 * 1024 * 1024 * 1024).unwrap()));
-
+    let state = Arc::new(RwLock::new(
+        storage::Storage::open(
+            std::path::PathBuf::from("data.store"),
+            10 * 1024 * 1024 * 1024,
+        )
+        .unwrap(),
+    ));
 
     loop {
         tokio::select! {
