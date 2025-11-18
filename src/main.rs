@@ -47,8 +47,9 @@ enum Command {
 }
 
 impl Command {
-    fn from_op(op: &[u8]) -> Command {
-        match String::from_utf8_lossy(&op).replace('\0', "").trim() {
+    fn from_op(op: &str) -> Command {
+        let op = unsafe {String::from_utf8_unchecked(op.as_bytes().to_vec())};
+        match op.replace('\0', "").trim() {
             "read" => Command::Read,
             "reads" => Command::Reads,
             "write" => Command::Write,
@@ -81,7 +82,7 @@ async fn handle_connection(socket: TcpStream, state: Arc<RwLock<storage::Storage
                 debug!("Operation: ~{}~", op.trim());
                 debug!("AAAAAAAAa: ~{}~", rest.trim());
 
-                let _ = match Command::from_op(op.trim().as_bytes()) {
+                let _ = match Command::from_op(op) {
                     Command::Read => {
                         match state.read().await.get_by_btree(rest.trim().as_bytes()) {
                             Some(v) => {
@@ -154,8 +155,7 @@ async fn handle_connection(socket: TcpStream, state: Arc<RwLock<storage::Storage
                 let _ = match Command::from_op(
                     String::from_utf8(buffer.to_vec())
                         .unwrap()
-                        .trim()
-                        .as_bytes(),
+                        .trim(),
                 ) {
                     Command::Status => write_half
                         .write(
