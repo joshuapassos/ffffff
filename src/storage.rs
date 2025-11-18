@@ -1,306 +1,391 @@
-use std::path::PathBuf;
-use std::collections::BTreeMap;
+use bincode::{Decode, Encode};
+use serde::{Deserialize, Serialize, de::value};
+use sha2::{Digest, Sha256};
+use std::{collections::BTreeMap, path::PathBuf};
+use tracing::debug;
 
 #[derive(Debug, PartialEq, Eq)]
 #[repr(C)]
 struct Header {
-  total_size: u64,
-  keys: u64,
+    total_size: u64,
+    keys: u64,
 
-  lookup_start: u64,
+    lookup_start: u64,
 
-  start_data: u64,
-  offset_free: u64,
+    start_data: u64,
+    offset_free: u64,
 }
 
 impl Header {
-  const SIZE: usize = 8 * 5;
+    const SIZE: usize = 8 * 5;
 
-
-  fn to_bytes(&self) -> [u8; Header::SIZE] {
-    let mut bytes = [0u8; Header::SIZE];
-    bytes[0..8].copy_from_slice(&self.total_size.to_le_bytes());
-    bytes[8..16].copy_from_slice(&self.keys.to_le_bytes());
-    bytes[16..24].copy_from_slice(&self.lookup_start.to_le_bytes());
-    bytes[24..32].copy_from_slice(&self.start_data.to_le_bytes());
-    bytes[32..40].copy_from_slice(&self.offset_free.to_le_bytes());
-    bytes
-  }
-
-  fn from_bytes(bytes: &[u8]) -> Self {
-    let total_size = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
-    let keys = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
-    let lookup_start = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
-    let start_data = u64::from_le_bytes(bytes[24..32].try_into().unwrap());
-    let offset_free = u64::from_le_bytes(bytes[32..40].try_into().unwrap());
-    Header {
-      total_size,
-      keys,
-      lookup_start,
-      start_data,
-      offset_free,
+    fn to_bytes(&self) -> [u8; Header::SIZE] {
+        let mut bytes = [0u8; Header::SIZE];
+        bytes[0..8].copy_from_slice(&self.total_size.to_le_bytes());
+        bytes[8..16].copy_from_slice(&self.keys.to_le_bytes());
+        bytes[16..24].copy_from_slice(&self.lookup_start.to_le_bytes());
+        bytes[24..32].copy_from_slice(&self.start_data.to_le_bytes());
+        bytes[32..40].copy_from_slice(&self.offset_free.to_le_bytes());
+        bytes
     }
-  }
+
+    fn from_bytes(bytes: &[u8]) -> Self {
+        let total_size = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+        let keys = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+        let lookup_start = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
+        let start_data = u64::from_le_bytes(bytes[24..32].try_into().unwrap());
+        let offset_free = u64::from_le_bytes(bytes[32..40].try_into().unwrap());
+        Header {
+            total_size,
+            keys,
+            lookup_start,
+            start_data,
+            offset_free,
+        }
+    }
 }
 
+#[derive(Debug, PartialEq, Eq)]
 enum EntryState {
-  Used = 0,
-  Deleted = 1,
+    Used = 0,
+    Deleted = 1,
 }
 
 struct HashEntry {
-  size_key: u64,
-  key: [u8; 1024],
-  data_offset: u64,
-  size: u64,
-  state: EntryState,
+    hash_key: [u8; 32],
+    size_key: u64,
+    key: [u8; 1024],
+    data_offset: u64,
+    size: u64,
+    state: EntryState,
 }
 
 impl HashEntry {
-  const SIZE: usize = 8 + 1024 + 8 + 8 + 1;
+    const SIZE: usize = 32 + 8 + 1024 + 8 + 8 + 1;
 
-  fn to_bytes(&self) -> [u8; HashEntry::SIZE] {
-    let mut bytes = [0u8; HashEntry::SIZE];
-    bytes[0..8].copy_from_slice(&self.size_key.to_le_bytes());
-    bytes[8..1032].copy_from_slice(&self.key);
-    bytes[1032..1040].copy_from_slice(&self.data_offset.to_le_bytes());
-    bytes[1040..1048].copy_from_slice(&self.size.to_le_bytes());
-    bytes[1048] = match self.state {
-      EntryState::Used => 0,
-      EntryState::Deleted => 1,
-    };
-    bytes
-  }
-
-  fn from_bytes(bytes: &[u8]) -> Self {
-    let size_key = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
-    let key = bytes[8..1032].try_into().unwrap();
-    let data_offset = u64::from_le_bytes(bytes[1032..1040].try_into().unwrap());
-    let size = u64::from_le_bytes(bytes[1040..1048].try_into().unwrap());
-    let state = match bytes[1048] {
-      0 => EntryState::Used,
-      1 => EntryState::Deleted,
-      _ => panic!("Invalid entry state"),
-    };
-    HashEntry {
-      size_key,
-      key,
-      data_offset,
-      size,
-      state,
+    fn to_bytes(&self) -> [u8; HashEntry::SIZE] {
+        let mut bytes = [0u8; HashEntry::SIZE];
+        bytes[0..32].copy_from_slice(&self.hash_key);
+        bytes[32..40].copy_from_slice(&self.size_key.to_le_bytes());
+        bytes[40..1064].copy_from_slice(&self.key);
+        bytes[1064..1072].copy_from_slice(&self.data_offset.to_le_bytes());
+        bytes[1072..1080].copy_from_slice(&self.size.to_le_bytes());
+        bytes[1080] = match self.state {
+            EntryState::Used => 0,
+            EntryState::Deleted => 1,
+        };
+        bytes
     }
-  }
 
-  fn is_used(&self) -> bool {
-    matches!(self.state, EntryState::Used)
-  }
-}
+    fn from_bytes(bytes: &[u8]) -> Self {
+        let hash_key = bytes[0..32].try_into().unwrap();
+        let size_key = u64::from_le_bytes(bytes[32..40].try_into().unwrap());
+        let key = bytes[40..1064].try_into().unwrap();
+        let data_offset = u64::from_le_bytes(bytes[1064..1072].try_into().unwrap());
+        let size = u64::from_le_bytes(bytes[1072..1080].try_into().unwrap());
+        let state = match bytes[1080] {
+            0 => EntryState::Used,
+            1 => EntryState::Deleted,
+            _ => {
+                debug!("Invalid entry state: {}", bytes[1080]);
+                EntryState::Deleted
+            },
+        };
+        HashEntry {
+            hash_key,
+            size_key,
+            key,
+            data_offset,
+            size,
+            state,
+        }
+    }
 
-
-struct BTreeHeader {
-  root_id: u64,
-  next_id: u64,
-  
+    fn is_used(&self) -> bool {
+        matches!(self.state, EntryState::Used)
+    }
 }
 
 pub struct Storage {
-  path: PathBuf,
-  header: Header,
-  mmap: memmap2::MmapMut,
-  mmap1kb: memmap2::MmapMut,
-  mmap10kb: memmap2::MmapMut,
-  mmap100kb: memmap2::MmapMut,
+    path: PathBuf,
+    header: Header,
+    file: std::fs::File,
+    mmap: memmap2::MmapMut,
+    // mmap1kb: memmap2::MmapMut,
+    // mmap10kb: memmap2::MmapMut,
+    // mmap100kb: memmap2::MmapMut,
+    btree: BTree,
 }
 
 impl Storage {
-  pub fn open(path: PathBuf, initial_size: u64) -> std::io::Result<Self> {
-    std::fs::create_dir_all(".data")?;
-    let mut data_path = std::path::PathBuf::from(".data");
+    pub fn open(path: PathBuf, initial_size: u64) -> std::io::Result<Self> {
+        std::fs::create_dir_all(".data")?;
+        let mut data_path = std::path::PathBuf::from(".data");
 
-    let mut file = std::fs::OpenOptions::new()
-      .read(true)
-      .write(true)
-      .create(true)
-      .open(data_path.clone().join("data.store"))?;
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(data_path.clone().join("data.store"))?;
 
-    let mut file1kb = std::fs::OpenOptions::new()
-      .read(true)
-      .write(true)
-      .create(true)
-      .open(data_path.clone().join("1kb.store"))?;
+        let metadata = file.metadata().unwrap();
 
-    let mut file10kb = std::fs::OpenOptions::new()
-      .read(true)
-      .write(true)
-      .create(true)
-      .open(data_path.clone().join("10kb.store"))?;
+        if metadata.len() < Header::SIZE as u64 {
+            file.set_len(initial_size)?;
+        }
 
-    let mut file100kb = std::fs::OpenOptions::new()
-      .read(true)
-      .write(true)
-      .create(true)
-      .open(data_path.clone().join("100kb.store"))?;
+        let mut mmap = unsafe { memmap2::MmapMut::map_mut(&file)? };
 
-    let metadata = file.metadata().unwrap();
+        let check = Header::from_bytes(&mmap[0..Header::SIZE]);
 
-    if metadata.len() < Header::SIZE as u64 {
-      file.set_len(initial_size)?;
+        debug!("Storage header: {:?}", check);
+
+        let header = if check.total_size == 0 && check.keys == 0 {
+            let header = Header {
+                total_size: initial_size,
+                keys: 0 as u64,
+                lookup_start: Header::SIZE as u64,
+                start_data: Header::SIZE as u64 + 1024 * 1024 * 1024,
+                offset_free: Header::SIZE as u64 + 1024 * 1024 * 1024,
+            };
+            let header_bytes = header.to_bytes();
+            (&mut mmap[0..Header::SIZE]).copy_from_slice(&header_bytes);
+            mmap.flush()?;
+            header
+        } else {
+            check
+        };
+
+        let mut btree_elements = Vec::new();
+        let mut offset = header.lookup_start;
+
+        debug!("Loading storage with {} keys", header.keys);
+
+        for _ in 0..header.keys {
+            let entry = HashEntry::from_bytes(
+                &mmap[offset as usize..(offset + HashEntry::SIZE as u64) as usize],
+            );
+
+            if entry.is_used() {
+                let hash_key = entry.hash_key;
+                let value = offset;
+
+                btree_elements.push((hash_key, value));
+            }
+            offset += HashEntry::SIZE as u64;
+        }
+
+        Ok(Storage {
+            btree: BTree::new(btree_elements),
+            path,
+            file,
+            header,
+            mmap,
+        })
     }
 
-    let mut mmap = unsafe { memmap2::MmapMut::map_mut(&file)? };
-    let mut mmap1kb = unsafe { memmap2::MmapMut::map_mut(&file1kb)? };
-    let mut mmap10kb = unsafe { memmap2::MmapMut::map_mut(&file10kb)? };
-    let mut mmap100kb = unsafe { memmap2::MmapMut::map_mut(&file100kb)? };
-
-    let check = Header::from_bytes(&mmap[0..Header::SIZE]);
-
-    let header = if check.total_size == 0 && check.keys == 0 {
-      let header = Header {
-        total_size: initial_size,
-        keys: 0 as u64,
-        lookup_start: Header::SIZE as u64,
-        start_data: Header::SIZE as u64 + 1024 * 1024 * 1024,
-        offset_free: Header::SIZE as u64 + 1024 * 1024 * 1024,
-      };
-      let header_bytes = header.to_bytes();
-      (&mut mmap[0..Header::SIZE]).copy_from_slice(&header_bytes);
-      mmap.flush()?;
-      header
-    } else {
-      check
-    };
-
-    Ok(Storage {
-      path,
-      header,
-      mmap,
-      mmap1kb,
-      mmap10kb,
-      mmap100kb,
-    })
-  }
-
-  pub fn get_header(&self) -> &Header {
-    &self.header
-  }
-
-  pub fn add(&mut self, key: &[u8], data: &[u8]) -> std::io::Result<()> {
-    let position = self.header.offset_free;
-
-    if key.len() > 1024 {
-      return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Key size exceeds maximum length"));
+    pub fn get_header(&self) -> &Header {
+        &self.header
     }
 
-    let mut buf =  [0u8; 1024];
+    pub fn add(&mut self, key: &[u8], data: &[u8]) -> std::io::Result<()> {
+        let position = self.header.offset_free;
 
-    buf[..key.len()].copy_from_slice(&key);
+        if key.len() > 1024 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Key size exceeds maximum length",
+            ));
+        }
 
-    let entry = HashEntry {
-      size_key: key.len() as u64,
-      key: buf,
-      data_offset: position,
-      size: data.len() as u64,
-      state: EntryState::Used,
-    };
+        let mut buf = [0u8; 1024];
 
+        buf[..key.len()].copy_from_slice(&key);
 
-    self.mmap[position as usize..(position + entry.size) as usize].copy_from_slice(data);
+        let entry = HashEntry {
+            hash_key: Sha256::digest(key).into(),
+            size_key: key.len() as u64,
+            key: buf,
+            data_offset: position,
+            size: data.len() as u64,
+            state: EntryState::Used,
+        };
 
-    let p_keys = |n| self.header.lookup_start + ((self.header.keys + n) * HashEntry::SIZE as u64);
+        self.mmap[position as usize..(position + entry.size) as usize].copy_from_slice(data);
 
-    self.mmap[p_keys(0) as usize..p_keys(1) as usize].copy_from_slice(&entry.to_bytes());
+        let p_keys =
+            |n| self.header.lookup_start + ((self.header.keys + n) * HashEntry::SIZE as u64);
 
-    self.header.offset_free += entry.size;
-    self.header.keys += 1;
+        let p_0 = p_keys(0);
 
-    let _ = self.mmap.flush_async();
+        self.mmap[p_0 as usize..p_keys(1) as usize].copy_from_slice(&entry.to_bytes());
 
-    Ok(())
-  }
+        self.header.offset_free += entry.size;
+        self.header.keys += 1;
 
-  pub fn search(&self, key: &[u8]) -> Option<&[u8]> {
-    let mut offset = self.header.lookup_start;
+        let header_bytes = self.header.to_bytes();
+        self.mmap[0..Header::SIZE].copy_from_slice(&header_bytes);
 
-    while offset < self.header.start_data {
-      let entry = HashEntry::from_bytes(&self.mmap[offset as usize..(offset + HashEntry::SIZE as u64) as usize]);
-      if &entry.key[0..entry.size_key as usize] == key && entry.is_used() {
-        return Some(&self.mmap[entry.data_offset as usize..(entry.data_offset + entry.size) as usize]);
-      }
-      offset += HashEntry::SIZE as u64;
+        self.btree.add(&entry.hash_key, p_0);
+
+        // let content = self.btree.serialize();
+
+        // self.mmap1kb[0..content.len()].copy_from_slice(content.as_slice());
+
+        // let _ = self.mmap1kb.flush_async();
+        let _ = self.mmap.flush_async();
+
+        Ok(())
     }
 
-    None
-  }
+    pub fn get_all(&self) -> Vec<([u8; 32], &[u8])> {
+        let mut results = Vec::new();
+        let mut offset = self.header.lookup_start;
 
-  pub fn search_p(&self, key: &[u8]) -> Option<Vec<u8>> {
-    let mut buff: Vec<u8> = Vec::new();
-    let mut offset = self.header.lookup_start;
+        while offset < self.header.lookup_start + (self.header.keys * HashEntry::SIZE as u64) {
+            let entry = HashEntry::from_bytes(
+                &self.mmap[offset as usize..(offset + HashEntry::SIZE as u64) as usize],
+            );
+            if entry.is_used() {
+                let hash_key = entry.hash_key;
+                let value = &self.mmap
+                    [entry.data_offset as usize..(entry.data_offset + entry.size) as usize];
+                results.push((hash_key, value));
+            }
+            offset += HashEntry::SIZE as u64;
+        }
 
-    while offset < self.header.start_data {
-      let entry = HashEntry::from_bytes(&self.mmap[offset as usize..(offset + HashEntry::SIZE as u64) as usize]);
-      if &entry.key[0..key.len() as usize] == key && entry.is_used() {
-        buff.append(&mut self.mmap[entry.data_offset as usize..(entry.data_offset + entry.size) as usize].to_vec());
-        buff.append(b"\r".to_vec().as_mut());
-      }
-      offset += HashEntry::SIZE as u64;
+        results
     }
 
-    if buff.len() > 0 {
-      Some(buff)
-    } else {
-      None
-    }
-  }
-
-  pub fn get(&mut self, data_offset: u64, data_size: u64) -> &[u8] {
-    &self.mmap[data_offset as usize..(data_offset + data_size) as usize]
-  }
-
-  pub fn del(&mut self, key: &[u8]) -> std::io::Result<()> {
-    let mut offset = self.header.lookup_start;
-
-    while offset < self.header.start_data {
-      let mut entry = HashEntry::from_bytes(&self.mmap[offset as usize..(offset + HashEntry::SIZE as u64) as usize]);
-      if &entry.key[0..entry.size_key as usize] == key && entry.is_used() {
-        entry.state = EntryState::Deleted;
-        self.mmap[offset as usize..(offset + HashEntry::SIZE as u64) as usize].copy_from_slice(&entry.to_bytes());
+    pub fn flush(&mut self) -> std::io::Result<()> {
         self.mmap.flush()?;
-        return Ok(());
-      }
-      offset += HashEntry::SIZE as u64;
+        self.file.sync_all()
     }
 
-    Err(std::io::Error::new(std::io::ErrorKind::NotFound, "Key not found"))
-  }
+    pub fn search_p(&self, key: &[u8]) -> Option<Vec<u8>> {
+        let mut buff: Vec<u8> = Vec::new();
+        let mut offset = self.header.lookup_start;
+
+        while offset < self.header.lookup_start + (self.header.keys * HashEntry::SIZE as u64) {
+            let entry = HashEntry::from_bytes(
+                &self.mmap[offset as usize..(offset + HashEntry::SIZE as u64) as usize],
+            );
+            if &entry.key[0..key.len() as usize] == key && entry.is_used() {
+                buff.append(
+                    &mut self.mmap
+                        [entry.data_offset as usize..(entry.data_offset + entry.size) as usize]
+                        .to_vec(),
+                );
+                buff.append(b"\r".to_vec().as_mut());
+            }
+            offset += HashEntry::SIZE as u64;
+        }
+
+        if buff.len() > 0 { Some(buff) } else { None }
+    }
+
+    pub fn get_by_btree(&self, key: &[u8]) -> Option<&[u8]> {
+        let str_key = str::from_utf8(key).unwrap();
+
+        match self.btree.get(str_key) {
+            Some(offset) => {
+                let entry = HashEntry::from_bytes(
+                    &self.mmap[*offset as usize..(*offset + HashEntry::SIZE as u64) as usize],
+                );
+                let data_offset = entry.data_offset;
+                let data_size = entry.size;
+                Some(&self.mmap[data_offset as usize..(data_offset + data_size) as usize])
+            }
+            _ => None,
+        }
+    }
+
+    pub fn del(&mut self, key: &[u8]) -> std::io::Result<()> {
+        match self.btree.get(str::from_utf8(key).unwrap()) {
+            Some(offset) => {
+                let mut entry = HashEntry::from_bytes(
+                    &self.mmap[*offset as usize..(*offset + HashEntry::SIZE as u64) as usize],
+                );
+                entry.state = EntryState::Deleted;
+                self.mmap[*offset as usize..(*offset + HashEntry::SIZE as u64) as usize]
+                    .copy_from_slice(&entry.to_bytes());
+                self.mmap.flush_async()?;
+                Ok(())
+            }
+            _ => Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "Key not found",
+            )),
+        }
+    }
 }
 
+#[derive(Encode, Decode)]
+struct BTree {
+    b_tree_1kb: BTreeMap<Vec<u8>, u64>,
+    b_tree_10kb: BTreeMap<Vec<u8>, u64>,
+    b_tree_100kb: BTreeMap<Vec<u8>, u64>,
+}
 
-#[cfg(test)]
-mod tests {
-  use super::*;
-
-  #[test]
-  fn test_storage() {
-    let path = PathBuf::from("test.db");
-    let initial_size = 1024 * 1024 * 10; // 10 MB
-    let mut storage = Storage::open(path, initial_size).unwrap();
-
-    {
-      let header = storage.get_header();
-      assert_eq!(header, &Header {
-        total_size: initial_size,
-        keys: 0,
-        lookup_start: Header::SIZE as u64,
-        start_data: Header::SIZE as u64 + 1024 * 1024,
-        offset_free: Header::SIZE as u64 + 1024 * 1024,
-      });
+impl BTree {
+    fn new(m: Vec<([u8; 32], u64)>) -> Self {
+        BTree {
+            b_tree_1kb: m.into_iter().map(|(k, v)| (k.to_vec(), v)).collect(),
+            b_tree_10kb: BTreeMap::new(),
+            b_tree_100kb: BTreeMap::new(),
+        }
     }
 
-    let key = *b"test1";
-    let data = b"Hello, world!";
-    storage.add(&key, data).unwrap();
-    let retrieved = storage.search(&key).unwrap();
-    assert_eq!(retrieved, b"Hello, world!");
+    fn add(&mut self, key: &[u8; 32], value: u64) {
+        if key.len() <= 1024 {
+            self.b_tree_1kb.insert(key.to_vec(), value);
+        } else if key.len() <= 10 * 1024 {
+            self.b_tree_10kb.insert(key.to_vec(), value);
+        } else if key.len() <= 100 * 1024 {
+            self.b_tree_100kb.insert(key.to_vec(), value);
+        }
+    }
 
-  }
+    fn get(&self, key: &str) -> Option<&u64> {
+        if key.len() <= 1024 {
+            self.b_tree_1kb.get(&Sha256::digest(key).to_vec())
+        } else if key.len() <= 10 * 1024 {
+            self.b_tree_10kb.get(&Sha256::digest(key).to_vec())
+        } else if key.len() <= 100 * 1024 {
+            self.b_tree_100kb.get(&Sha256::digest(key).to_vec())
+        } else {
+            None
+        }
+    }
+
+    fn del(&mut self, key: &str) {
+        if key.len() <= 1024 {
+            self.b_tree_1kb.remove(&Sha256::digest(key).to_vec());
+        } else if key.len() <= 10 * 1024 {
+            self.b_tree_10kb.remove(&Sha256::digest(key).to_vec());
+        } else if key.len() <= 100 * 1024 {
+            self.b_tree_100kb.remove(&Sha256::digest(key).to_vec());
+        }
+    }
+
+    // from https://docs.rs/bincode/latest/bincode/#example
+    fn serialize(&self) -> Vec<u8> {
+        bincode::encode_to_vec(
+            &self.b_tree_1kb,
+            bincode::config::standard().with_fixed_int_encoding(),
+        )
+        .unwrap()
+    }
+    // from https://docs.rs/bincode/latest/bincode/#example
+    fn deserialize(data: &[u8]) -> Self {
+        let (b_tree_1kb, _): (BTreeMap<Vec<u8>, u64>, _) =
+            bincode::decode_from_slice(data, bincode::config::standard().with_fixed_int_encoding())
+                .unwrap();
+        BTree {
+            b_tree_1kb,
+            b_tree_10kb: BTreeMap::new(),
+            b_tree_100kb: BTreeMap::new(),
+        }
+    }
 }

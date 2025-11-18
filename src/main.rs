@@ -8,7 +8,7 @@ use tokio::net::*;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{Level, debug};
 use tracing_subscriber::FmtSubscriber;
-
+use tokio::signal;
 
 enum Response<T>{
     Success(T),
@@ -92,9 +92,15 @@ async fn handle_connection(socket: TcpStream, state: Arc<RwLock<storage::Storage
 
                 let _ =  match Command::from_op(op.trim().as_bytes()) {
                     Command::Read =>
-                        match state.read().await.search(rest.trim().as_bytes()){
-                            Some(v) => write_half.write(&Response::Success(v).parse()).await.unwrap(),
-                            None => write_half.write(&Response::<&[u8]>::Failure.parse()).await.unwrap(),
+                        match state.read().await.get_by_btree(rest.trim().as_bytes()){
+                            Some(v) => {
+                            debug!("Read key: '{}' value: '{:?}'", rest.trim(), v);
+                            write_half.write(&Response::Success(v).parse()).await.unwrap()
+                        }
+                            None => {
+                                debug!("Read key: '{}' not found", rest.trim());
+                                write_half.write(&Response::<&[u8]>::Failure.parse()).await.unwrap()
+                            }
                         },
                     Command::Reads => write_half.write(&Response::<String>::Success("Reads".into()).parse()).await.unwrap(),
                     Command::Write => {
@@ -130,95 +136,6 @@ async fn handle_connection(socket: TcpStream, state: Arc<RwLock<storage::Storage
 }
 
 
-// async fn parse_commands(state: Arc<HashMap<String, String>>, socket: &mut TcpStream, op: &[u8]) {
-//     let mut buffer = Vec::new();
-//     let mut reader = BufReader::new(&mut *socket);
-
-
-//     match Command::from_op(&op) {
-//         Command::Write => {
-//             reader.read_until(b'\r', &mut buffer).await.unwrap();
-
-//             match String::from_utf8(buffer.to_vec()).unwrap().split_once("|") {
-//                 Some((key, value)) => {
-//                     debug!("Writing key: '{}' value: '{}'", key.trim(), value.trim());
-//                     state.pin().insert(key.trim().to_string(), value.trim().to_string());
-//                     socket.write_all(&Response::Success("Success".into()).parse()).await.unwrap();
-//                 },
-//                 None => {
-//                     socket.write_all(&Response::Failure.parse()).await.unwrap();
-//                 }
-//             }
-
-//         },
-//         Command::Read => {
-//             debug!("Reading...");
-//             reader.read_until(b'\r', &mut buffer).await.unwrap();
-
-//             let key = String::from_utf8(buffer.to_vec()).unwrap().trim().to_string();
-
-
-//             let r = {
-//                 let state_ref = state.pin();
-//                 state_ref.get(&key).map(|v| v.to_string())
-//             };
-
-
-//             debug!("Read {} bytes, '{}' <{:?}>", buffer.len(), key, r);
-
-//             match r {
-//                 Some(v) => {
-//                     socket.write_all(&Response::Success(v.into()).parse()).await.unwrap();
-//                 },
-//                 None => {
-//                     socket.write_all(&Response::Failure.parse()).await.unwrap();
-//                 }
-//             };
-
-//         },
-//         Command::Reads => {
-//             debug!("Readings...");
-//             reader.read_until(b'\r', &mut buffer).await.unwrap();
-
-//             let key = String::from_utf8(buffer.to_vec()).unwrap().trim().to_string();
-
-
-//             let r = {
-//                 let state_ref = state.pin();
-//                 state_ref.get(&key).map(|v| v.to_string())
-//             };
-
-
-//             debug!("Read {} bytes, '{}' <{:?}>", buffer.len(), key, r);
-
-//             match r {
-//                 Some(v) => {
-//                     socket.write_all(&Response::Success(v.into()).parse()).await.unwrap();
-//                 },
-//                 None => {
-//                     socket.write_all(&Response::Failure.parse()).await.unwrap();
-//                 }
-//             };
-
-//         },
-//         Command::Delete => {
-//             socket.read_to_end(&mut buffer).await.unwrap();
-
-//             let key = String::from_utf8(buffer.to_vec()).unwrap();
-
-//             if state.pin().remove(&key).is_some() {
-//                 socket.write_all(&Response::Success("Success".into()).parse()).await.unwrap();
-//             } else {
-//                 socket.write_all(&Response::Failure.parse()).await.unwrap();
-//             }
-
-
-//         },
-//         Command::Status => socket.write_all(&Response::Success("well going our operation".into()).parse()).await.unwrap(),
-//         _ => socket.write_all(&Response::Failure.parse()).await.unwrap(),
-//     }
-// }
-
 #[tokio::main]
 async fn main() {
     let subscriber = FmtSubscriber::builder()
@@ -237,14 +154,26 @@ async fn main() {
 
 
     loop {
-        let (socket, _) = listener.accept().await.unwrap();
-
-        debug!("New connection established from {}", socket.peer_addr().unwrap());
-
-
-        let state = Arc::clone(&state);
-        tokio::spawn(async move{
-            handle_connection(socket, state).await;
-        });
+        tokio::select! {
+            result = listener.accept() => {
+                match result {
+                    Ok((socket, _)) => {
+                        debug!("New connection from {}", socket.peer_addr().unwrap());
+                        let state = Arc::clone(&state);
+                        tokio::spawn(async move {
+                            handle_connection(socket, state).await;
+                        });
+                    }
+                    Err(e) => {
+                        debug!("Error accepting connection: {}", e);
+                    }
+                }
+            }
+            _ = signal::ctrl_c() => {
+                debug!("Received shutdown signal");
+                state.write().await.flush().unwrap();
+                break;
+            }
+        }
     }
 }
