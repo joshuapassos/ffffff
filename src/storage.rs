@@ -140,7 +140,7 @@ pub struct Storage {
     // mmap1kb: memmap2::MmapMut,
     // mmap10kb: memmap2::MmapMut,
     // mmap100kb: memmap2::MmapMut,
-    btree: BTree,
+    btree: Index,
 }
 
 impl Storage {
@@ -204,7 +204,7 @@ impl Storage {
         }
 
         Ok(Storage {
-            btree: BTree::new(btree_elements),
+            btree: Index::new(btree_elements),
             path,
             file,
             header,
@@ -365,14 +365,19 @@ impl Storage {
     }
 }
 
-struct BTree {
+struct Index {
     index: HashMap<[u8; 32], u64>,
 }
 
-impl BTree {
+impl Index {
     fn new(m: Vec<([u8; 32], u64)>) -> Self {
-        BTree {
-            index: m.into_iter().map(|(k, v)| (k, v)).collect(),
+
+        let mut hm = HashMap::with_capacity(10_000_000);
+
+        hm.extend(m.into_iter().map(|(k, v)| (k, v)).into_iter());
+
+        Index {
+            index: hm
         }
     }
 
