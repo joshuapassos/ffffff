@@ -64,7 +64,7 @@ impl Command {
     }
 }
 
-async fn handle_connection(socket: TcpStream, state: Arc<RwLock<storage::Storage>>) {
+async fn handle_connection(socket: TcpStream, state: Arc<storage::Storage>) {
     let (read_half, mut write_half) = socket.into_split();
     let mut reader = BufReader::new(read_half);
 
@@ -84,7 +84,11 @@ async fn handle_connection(socket: TcpStream, state: Arc<RwLock<storage::Storage
 
                 let _ = match Command::from_op(op) {
                     Command::Read => {
-                        match state.read().await.get_by_btree(rest.trim().as_bytes()) {
+
+                        let shard = state.get_shard(rest.trim().as_bytes());
+
+
+                        match shard.read().await.get_by_btree(rest.trim().as_bytes()) {
                             Some(v) => {
                                 debug!("Read key: '{}' value: '{:?}'", rest.trim(), v);
                                 write_half
@@ -108,7 +112,8 @@ async fn handle_connection(socket: TcpStream, state: Arc<RwLock<storage::Storage
                     Command::Write => match rest.trim().split_once("|") {
                         Some((key, value)) => {
                             debug!("Writing key: '{}' value: '{}'", key.trim(), value.trim());
-                            state
+                            let shard = state.get_shard(key.trim().as_bytes());
+                            shard
                                 .write()
                                 .await
                                 .add(key.trim().as_bytes(), value.trim().as_bytes())
@@ -124,7 +129,8 @@ async fn handle_connection(socket: TcpStream, state: Arc<RwLock<storage::Storage
                             .unwrap(),
                     },
                     Command::Delete => {
-                        match state.write().await.del(rest.trim().as_bytes()) {
+                        let shard = state.get_shard(rest.trim().as_bytes());
+                        match shard.write().await.del(rest.trim().as_bytes()) {
                             Ok(_) => {
                                 debug!("Deleted key: '{}'", rest.trim());
                                 write_half
@@ -190,12 +196,9 @@ async fn main() {
 
     debug!("Server running on {}", addr);
 
-    let state = Arc::new(RwLock::new(
-        storage::Storage::open(
-            10 * 1024 * 1024 * 1024,
-        )
-        .unwrap(),
-    ));
+    let state = Arc::new(
+        storage::Storage::open(10 * 1024 * 1024 * 1024, 16).unwrap()
+    );
 
     loop {
         tokio::select! {
@@ -203,7 +206,7 @@ async fn main() {
                 match result {
                     Ok((socket, _)) => {
                         debug!("New connection from {}", socket.peer_addr().unwrap());
-                        let state = Arc::clone(&state);
+                        let state = state.clone();
                         tokio::spawn(async move {
                             handle_connection(socket, state).await;
                         });
@@ -215,7 +218,7 @@ async fn main() {
             }
             _ = signal::ctrl_c() => {
                 debug!("Received shutdown signal");
-                state.write().await.flush().unwrap();
+                state.flush().await.unwrap();
                 break;
             }
         }

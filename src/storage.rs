@@ -1,5 +1,6 @@
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::{collections::HashMap, hash::{DefaultHasher, Hash, Hasher}};
+use tokio::sync::RwLock;
 use tracing::debug;
 use zerocopy::{FromBytes, IntoBytes};
 use zerocopy_derive::{FromBytes, Immutable, IntoBytes, KnownLayout};
@@ -69,6 +70,10 @@ impl HashEntry {
 }
 
 pub struct Storage {
+    shards: Vec<RwLock<Shard>>,
+}
+
+pub struct Shard {
     header: Header,
     file: std::fs::File,
     mmap: memmap2::MmapMut,
@@ -76,73 +81,97 @@ pub struct Storage {
 }
 
 impl Storage {
-    pub fn open(initial_size: u64) -> std::io::Result<Self> {
+    pub fn open(initial_size: u64, num_shards: usize) -> std::io::Result<Self> {
         std::fs::create_dir_all(".data")?;
         let data_path = std::path::PathBuf::from(".data");
 
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .open(data_path.clone().join("data.store"))?;
+        let mut shards = Vec::with_capacity(num_shards);
 
-        let metadata = file.metadata().unwrap();
+        for id in 0..num_shards {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .open(data_path.clone().join(format!("shard_{}.store", id)))?;
 
-        if metadata.len() < Header::SIZE as u64 {
-            file.set_len(initial_size)?;
-        }
+            let metadata = file.metadata().unwrap();
 
-        let mut mmap = unsafe { memmap2::MmapMut::map_mut(&file)? };
-
-        let check = Header::read_from_bytes(&mmap[0..Header::SIZE]).unwrap();
-
-        debug!("Storage header: {:?}", check);
-
-        let header = if check.total_size == 0 && check.keys == 0 {
-            let header = Header {
-                total_size: initial_size,
-                keys: 0 as u64,
-                lookup_start: Header::SIZE as u64,
-                start_data: Header::SIZE as u64 + 1024 * 1024 * 1024 * 4,
-                offset_free: Header::SIZE as u64 + 1024 * 1024 * 1024 * 4,
-            };
-            let header_bytes = header.as_bytes();
-            (&mut mmap[0..Header::SIZE]).copy_from_slice(&header_bytes);
-            mmap.flush()?;
-            header
-        } else {
-            check
-        };
-
-        let mut btree_elements = Vec::new();
-        let mut offset = header.lookup_start;
-
-        debug!("Loading storage with {} keys", header.keys);
-
-        for _ in 0..header.keys {
-            let entry = HashEntry::read_from_bytes(
-                &mmap[offset as usize..(offset + HashEntry::SIZE as u64) as usize],
-            );
-
-            if let Ok(entry) = entry {
-                if entry.is_used() {
-                    let hash_key = entry.hash_key;
-                    let value = offset;
-
-                    btree_elements.push((hash_key, value));
-                }
+            if metadata.len() < Header::SIZE as u64 {
+                file.set_len(initial_size)?;
             }
-            offset += HashEntry::SIZE as u64;
+
+            let mut mmap = unsafe { memmap2::MmapMut::map_mut(&file)? };
+
+            let check = Header::read_from_bytes(&mmap[0..Header::SIZE]).unwrap();
+
+            debug!("Shard header: {:?}", check);
+
+            let header = if check.total_size == 0 && check.keys == 0 {
+                let header = Header {
+                    total_size: initial_size,
+                    keys: 0 as u64,
+                    lookup_start: Header::SIZE as u64,
+                    start_data: Header::SIZE as u64 + 1024 * 1024 * 1024 * 2,
+                    offset_free: Header::SIZE as u64 + 1024 * 1024 * 1024 * 2,
+                };
+                let header_bytes = header.as_bytes();
+                (&mut mmap[0..Header::SIZE]).copy_from_slice(&header_bytes);
+                mmap.flush()?;
+                header
+            } else {
+                check
+            };
+
+            let mut btree_elements = Vec::new();
+            let mut offset = header.lookup_start;
+
+            debug!("Loading shard with {} keys", header.keys);
+
+            for _ in 0..header.keys {
+                let entry = HashEntry::read_from_bytes(
+                    &mmap[offset as usize..(offset + HashEntry::SIZE as u64) as usize],
+                );
+
+                if let Ok(entry) = entry {
+                    if entry.is_used() {
+                        let hash_key = entry.hash_key;
+                        let value = offset;
+
+                        btree_elements.push((hash_key, value));
+                    }
+                }
+                offset += HashEntry::SIZE as u64;
+            }
+
+            shards.push(RwLock::new(Shard {
+                index: Index::new(btree_elements),
+                file,
+                header,
+                mmap,
+            }));
         }
 
-        Ok(Storage {
-            index: Index::new(btree_elements),
-            file,
-            header,
-            mmap,
-        })
+        Ok(Storage { shards })
     }
 
+    pub fn get_shard(&self, key: &[u8]) -> &RwLock<Shard> {
+        let mut hasher = DefaultHasher::new();
+        key.hash(&mut hasher);
+        let hash_u64 = hasher.finish();
+
+        let mask = (self.shards.len() - 1) as u64;
+        &self.shards[(hash_u64 & mask) as usize]
+    }
+
+    pub async fn flush(&self) -> std::io::Result<()> {
+        for shard in &self.shards {
+            shard.write().await.flush()?;
+        }
+        Ok(())
+    }
+}
+
+impl Shard {
     pub fn add(&mut self, key: &[u8], data: &[u8]) -> std::io::Result<()> {
         let position = self.header.offset_free;
 
@@ -201,7 +230,8 @@ impl Storage {
             Some(offset) => {
                 let entry = HashEntry::read_from_bytes(
                     &self.mmap[*offset as usize..(*offset + HashEntry::SIZE as u64) as usize],
-                ).unwrap();
+                )
+                .unwrap();
                 let data_offset = entry.data_offset;
                 let data_size = entry.size;
                 debug!("Found key '{}' - {:?}", str_key, entry);
@@ -217,7 +247,8 @@ impl Storage {
             Some(offset) => {
                 let mut entry = HashEntry::read_from_bytes(
                     &self.mmap[*offset as usize..(*offset + HashEntry::SIZE as u64) as usize],
-                ).unwrap();
+                )
+                .unwrap();
                 entry.state = EntryState::Deleted.to_u8();
                 self.mmap[*offset as usize..(*offset + HashEntry::SIZE as u64) as usize]
                     .copy_from_slice(&entry.as_mut_bytes());
@@ -239,14 +270,11 @@ struct Index {
 
 impl Index {
     fn new(m: Vec<([u8; 32], u64)>) -> Self {
-
-        let mut hm = HashMap::with_capacity(10_000_000);
+        let mut hm = HashMap::with_capacity(10_000);
 
         hm.extend(m.into_iter().map(|(k, v)| (k, v)).into_iter());
 
-        Index {
-            index: hm
-        }
+        Index { index: hm }
     }
 
     fn add(&mut self, key: &[u8; 32], value: u64) {
@@ -268,5 +296,4 @@ impl Index {
 
         self.index.remove(&buf);
     }
-
 }
