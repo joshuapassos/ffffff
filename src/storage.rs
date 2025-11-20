@@ -1,8 +1,5 @@
-use bincode::{Decode, Encode};
-use serde::{Deserialize, Serialize, de::value};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::path::PathBuf;
 use tracing::debug;
 use zerocopy::{FromBytes, IntoBytes};
 use zerocopy_derive::{FromBytes, Immutable, IntoBytes, KnownLayout};
@@ -21,31 +18,6 @@ struct Header {
 
 impl Header {
     const SIZE: usize = 8 * 5;
-
-    fn _to_bytes(&self) -> [u8; Header::SIZE] {
-        let mut bytes = [0u8; Header::SIZE];
-        bytes[0..8].copy_from_slice(&self.total_size.to_le_bytes());
-        bytes[8..16].copy_from_slice(&self.keys.to_le_bytes());
-        bytes[16..24].copy_from_slice(&self.lookup_start.to_le_bytes());
-        bytes[24..32].copy_from_slice(&self.start_data.to_le_bytes());
-        bytes[32..40].copy_from_slice(&self.offset_free.to_le_bytes());
-        bytes
-    }
-
-    fn _from_bytes(bytes: &[u8]) -> Self {
-        let total_size = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
-        let keys = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
-        let lookup_start = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
-        let start_data = u64::from_le_bytes(bytes[24..32].try_into().unwrap());
-        let offset_free = u64::from_le_bytes(bytes[32..40].try_into().unwrap());
-        Header {
-            total_size,
-            keys,
-            lookup_start,
-            start_data,
-            offset_free,
-        }
-    }
 }
 
 #[derive(Debug, PartialEq, Eq, KnownLayout, Default, Immutable, IntoBytes)]
@@ -89,43 +61,7 @@ struct HashEntry {
 }
 
 impl HashEntry {
-    const SIZE: usize = 32 + 8 + 1024 + 8 + 8 + 1;
-
-    fn _to_bytes(&self) -> [u8; HashEntry::SIZE] {
-        let mut bytes = [0u8; HashEntry::SIZE];
-        bytes[0..32].copy_from_slice(&self.hash_key);
-        bytes[32..40].copy_from_slice(&self.size_key.to_le_bytes());
-        bytes[40..1064].copy_from_slice(&self.key);
-        bytes[1064..1072].copy_from_slice(&self.data_offset.to_le_bytes());
-        bytes[1072..1080].copy_from_slice(&self.size.to_le_bytes());
-        bytes[1080] = self.state;
-        bytes
-    }
-
-    fn _from_bytes(bytes: &[u8]) -> Self {
-        let hash_key = bytes[0..32].try_into().unwrap();
-        let size_key = u64::from_le_bytes(bytes[32..40].try_into().unwrap());
-        let key = bytes[40..1064].try_into().unwrap();
-        let data_offset = u64::from_le_bytes(bytes[1064..1072].try_into().unwrap());
-        let size = u64::from_le_bytes(bytes[1072..1080].try_into().unwrap());
-        let state = match bytes[1080] {
-            0 => EntryState::Used.to_u8(),
-            1 => EntryState::Deleted.to_u8(),
-            _ => {
-                debug!("Invalid entry state: {}", bytes[1080]);
-                EntryState::Deleted.to_u8()
-            }
-        };
-        HashEntry {
-            hash_key,
-            size_key,
-            key,
-            data_offset,
-            size,
-            state,
-            _padding: [0u8; 7],
-        }
-    }
+    const SIZE: usize = 32 + 8 + 1024 + 8 + 8 + 1 + 7;
 
     fn is_used(&self) -> bool {
         matches!(EntryState::from_u8(self.state), EntryState::Used)
@@ -133,22 +69,18 @@ impl HashEntry {
 }
 
 pub struct Storage {
-    path: PathBuf,
     header: Header,
     file: std::fs::File,
     mmap: memmap2::MmapMut,
-    // mmap1kb: memmap2::MmapMut,
-    // mmap10kb: memmap2::MmapMut,
-    // mmap100kb: memmap2::MmapMut,
-    btree: Index,
+    index: Index,
 }
 
 impl Storage {
-    pub fn open(path: PathBuf, initial_size: u64) -> std::io::Result<Self> {
+    pub fn open(initial_size: u64) -> std::io::Result<Self> {
         std::fs::create_dir_all(".data")?;
-        let mut data_path = std::path::PathBuf::from(".data");
+        let data_path = std::path::PathBuf::from(".data");
 
-        let mut file = std::fs::OpenOptions::new()
+        let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
@@ -204,16 +136,11 @@ impl Storage {
         }
 
         Ok(Storage {
-            btree: Index::new(btree_elements),
-            path,
+            index: Index::new(btree_elements),
             file,
             header,
             mmap,
         })
-    }
-
-    pub fn get_header(&self) -> &Header {
-        &self.header
     }
 
     pub fn add(&mut self, key: &[u8], data: &[u8]) -> std::io::Result<()> {
@@ -255,37 +182,11 @@ impl Storage {
         let header_bytes = self.header.as_bytes();
         self.mmap[0..Header::SIZE].copy_from_slice(&header_bytes);
 
-        self.btree.add(&entry.hash_key, p_0);
+        self.index.add(&entry.hash_key, p_0);
 
         let _ = self.mmap.flush_async();
 
         Ok(())
-    }
-
-    pub fn get_all(&self) -> Vec<([u8; 32], &[u8])> {
-        let mut results = Vec::new();
-        let mut offset = self.header.lookup_start;
-
-        while offset < self.header.lookup_start + (self.header.keys * HashEntry::SIZE as u64) {
-            let entry = HashEntry::read_from_bytes(
-                &self.mmap[offset as usize..(offset + HashEntry::SIZE as u64) as usize],
-            )
-            .unwrap();
-            if entry.is_used() {
-                let hash_key = entry.hash_key;
-                let value = &self.mmap
-                    [entry.data_offset as usize..(entry.data_offset + entry.size) as usize];
-                results.push((hash_key, value));
-            }
-            offset += HashEntry::SIZE as u64;
-        }
-
-        results
-    }
-
-    pub fn get_all_keys(&self) -> Vec<[u8; 32]> {
-        let result = self.get_all();
-        result.into_iter().map(|(k, _)| k).collect()
     }
 
     pub fn flush(&mut self) -> std::io::Result<()> {
@@ -293,43 +194,10 @@ impl Storage {
         self.file.sync_all()
     }
 
-    pub fn search_p(&self, key: &[u8]) -> Option<Vec<u8>> {
-        let mut buff: Vec<u8> = Vec::new();
-        let mut offset = self.header.lookup_start;
-
-        while offset < self.header.lookup_start + (self.header.keys * HashEntry::SIZE as u64) {
-            let entry = HashEntry::read_from_bytes(
-                &self.mmap[offset as usize..(offset + HashEntry::SIZE as u64) as usize],
-            )
-            .unwrap();
-            if &entry.key[0..key.len() as usize] == key && entry.is_used() {
-                buff.append(
-                    &mut self.mmap
-                        [entry.data_offset as usize..(entry.data_offset + entry.size) as usize]
-                        .to_vec(),
-                );
-                buff.append(b"\r".to_vec().as_mut());
-            }
-            offset += HashEntry::SIZE as u64;
-        }
-
-        if buff.len() > 0 { Some(buff) } else { None }
-    }
-
-    pub fn get_el(&self, offset: u64) -> &[u8] {
-        let entry = HashEntry::read_from_bytes(
-            &self.mmap[offset as usize..(offset + HashEntry::SIZE as u64) as usize],
-        )
-        .unwrap();
-        let data_offset = entry.data_offset;
-        let data_size = entry.size;
-        &self.mmap[data_offset as usize..(data_offset + data_size) as usize]
-    }
-
     pub fn get_by_btree(&self, key: &[u8]) -> Option<&[u8]> {
         let str_key = str::from_utf8(key).unwrap();
 
-        match self.btree.get(str_key) {
+        match self.index.get(str_key) {
             Some(offset) => {
                 let entry = HashEntry::read_from_bytes(
                     &self.mmap[*offset as usize..(*offset + HashEntry::SIZE as u64) as usize],
@@ -345,7 +213,7 @@ impl Storage {
 
     pub fn del(&mut self, key: &[u8]) -> std::io::Result<()> {
         let k = str::from_utf8(key).unwrap();
-        match self.btree.get(k) {
+        match self.index.get(k) {
             Some(offset) => {
                 let mut entry = HashEntry::read_from_bytes(
                     &self.mmap[*offset as usize..(*offset + HashEntry::SIZE as u64) as usize],
@@ -353,7 +221,7 @@ impl Storage {
                 entry.state = EntryState::Deleted.to_u8();
                 self.mmap[*offset as usize..(*offset + HashEntry::SIZE as u64) as usize]
                     .copy_from_slice(&entry.as_mut_bytes());
-                self.btree.del(k);
+                self.index.del(k);
                 self.mmap.flush_async()?;
                 Ok(())
             }
@@ -401,19 +269,4 @@ impl Index {
         self.index.remove(&buf);
     }
 
-    // // from https://docs.rs/bincode/latest/bincode/#example
-    // fn serialize(&self) -> Vec<u8> {
-    //     bincode::encode_to_vec(
-    //         &self.b_tree_1kb,
-    //         bincode::config::standard().with_fixed_int_encoding(),
-    //     )
-    //     .unwrap()
-    // }
-    // // from https://docs.rs/bincode/latest/bincode/#example
-    // fn deserialize(data: &[u8]) -> Self {
-    //     let (b_tree_1kb, _): (BTreeMap<Vec<u8>, u64>, _) =
-    //         bincode::decode_from_slice(data, bincode::config::standard().with_fixed_int_encoding())
-    //             .unwrap();
-    //     BTree { b_tree_1kb }
-    // }
 }

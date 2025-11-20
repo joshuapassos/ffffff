@@ -185,14 +185,13 @@ async fn main() {
 
     tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
 
-    let addr = "127.0.0.1:6969";
+    let addr = "127.0.0.1:8085";
     let listener = TcpListener::bind(addr).await.unwrap();
 
     debug!("Server running on {}", addr);
 
     let state = Arc::new(RwLock::new(
         storage::Storage::open(
-            std::path::PathBuf::from("data.store"),
             10 * 1024 * 1024 * 1024,
         )
         .unwrap(),
