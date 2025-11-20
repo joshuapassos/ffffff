@@ -4,14 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-bincode = "2.0.1"
-btree-range-map = "0.7.2"
-btree-slab = "0.6.1"
-fnv = "1.0.7"
 memmap2 = "0.9.9"
-mmap-io = "0.9.4"
-papaya = "0.2.3"
-serde = "1.0.228"
 sha2 = "0.10.9"
 tokio = { version = "1.35.1", features = ["full"] }
 tracing = "0.1.41"
